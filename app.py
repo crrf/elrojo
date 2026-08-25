@@ -1275,10 +1275,28 @@ def sales():
             logger.error(f"Error in sales endpoint: {e}")
 
     sales_data = get_recent_sales_with_totals(connection, constants.MAX_RECENT_RECORDS)
-    products = connection.execute("SELECT * FROM products WHERE active=1").fetchall()
+    products = connection.execute("SELECT * FROM products WHERE active=1 ORDER BY name").fetchall()
+
+    # POS grid needs per-store stock so a tile can show availability and the
+    # cart can warn before submitting. Shipped as one JSON blob rather than a
+    # request per store — this app's scale makes that cheap, and it keeps the
+    # page a single render with no AJAX round-trips.
+    stock_by_store = {}
+    for row in connection.execute(
+        "SELECT location_id, product_id, quantity FROM stock WHERE location_type='store'"
+    ).fetchall():
+        stock_by_store.setdefault(str(row["location_id"]), {})[str(row["product_id"])] = row["quantity"]
+
+    products_json = [
+        {"id": p["id"], "sku": p["sku"], "name": p["name"], "price_cents": p["sale_price_cents"]}
+        for p in products
+    ]
     return render_template("sales.html", stores=stores, sales=sales_data, products=products,
-                            item_rows=range(1, constants.MAX_SALE_ITEM_ROWS + 1),
-                            payment_rows=range(1, constants.MAX_SALE_PAYMENT_ROWS + 1))
+                            products_json=products_json, stock_by_store=stock_by_store,
+                            max_item_rows=constants.MAX_SALE_ITEM_ROWS,
+                            max_payment_rows=constants.MAX_SALE_PAYMENT_ROWS,
+                            payment_methods=constants.VALID_PAYMENT_METHODS,
+                            payment_display=constants.PAYMENT_DISPLAY_NAMES)
 
 
 def _parse_denomination_form(form):
@@ -1517,10 +1535,32 @@ def daily_closing():
 
         has_variance = (abs(cash_variance_cents) > constants.RECONCILIATION_VARIANCE_THRESHOLD_CENTS or
                          abs(reconciliation_difference_cents) > constants.RECONCILIATION_VARIANCE_THRESHOLD_CENTS)
-        if has_variance and not justification_note:
-            flash("Hay una variación en el cierre (cash_variance o reconciliation_difference distinto de 0). "
-                  "Se requiere una nota de justificación para finalizar.", "error")
-            return redirect(url_for("daily_closing", store_id=store_id, business_date=business_date))
+
+        # Confirmed with the product owner 2026-08-25 — this REVERSES the
+        # original brief ("do NOT block the closing"): a variance now blocks
+        # finalization by default. Only PERM_CLOSING_VARIANCE_OVERRIDE holders
+        # (admin, store_manager) can push it through, and only with a
+        # justification note. Everyone else must recount or escalate.
+        if has_variance:
+            can_override = constants.has_permission(g.user["role"], constants.PERM_CLOSING_VARIANCE_OVERRIDE)
+            if not can_override:
+                flash(
+                    f"No se puede finalizar: hay una diferencia sin resolver "
+                    f"(diferencia de caja ${format_cents(cash_variance_cents)}, "
+                    f"diferencia de conciliación ${format_cents(reconciliation_difference_cents)}). "
+                    f"Vuelve a contar el efectivo o solicita a un gerente/administrador que lo autorice.",
+                    "error"
+                )
+                logger.warning(
+                    f"Closing blocked on variance for store {store_id} on {business_date} by user {g.user['id']} "
+                    f"({g.user['role']}): cash_variance={cash_variance_cents}, "
+                    f"reconciliation_difference={reconciliation_difference_cents}"
+                )
+                return redirect(url_for("daily_closing", store_id=store_id, business_date=business_date))
+            if not justification_note:
+                flash("Hay una variación en el cierre (cash_variance o reconciliation_difference distinto de 0). "
+                      "Se requiere una nota de justificación para finalizar.", "error")
+                return redirect(url_for("daily_closing", store_id=store_id, business_date=business_date))
 
         status = constants.DAILY_CLOSING_STATUS_FINALIZED_WITH_VARIANCE if has_variance else constants.DAILY_CLOSING_STATUS_FINALIZED
 
@@ -1571,6 +1611,7 @@ def daily_closing():
         denominations=constants.CASH_DENOMINATIONS_CENTS,
         recent_closings=recent_closings,
         variance_threshold_cents=constants.RECONCILIATION_VARIANCE_THRESHOLD_CENTS,
+        can_override_variance=constants.has_permission(g.user["role"], constants.PERM_CLOSING_VARIANCE_OVERRIDE),
     )
 
 

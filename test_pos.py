@@ -819,6 +819,119 @@ class TestDailyClosing:
         assert b"No tienes permisos" in response.data
 
 
+class TestVarianceBlocking:
+    """Confirmed with the product owner 2026-08-25 — REVERSES the original
+    brief's "do NOT block the closing". A non-zero variance now blocks
+    finalization; only PERM_CLOSING_VARIANCE_OVERRIDE holders (admin,
+    store_manager) can override, and only with a justification note."""
+
+    def test_accountant_is_blocked_by_variance_and_cannot_override(self, client, app):
+        _create_user(client, "acct_block", "accountant")
+        client.post("/login", data={"username": "acct_block", "password": "password123"})
+        today = _today_utc()
+        # $30 counted with no sales -> non-zero cash_variance.
+        response = _finalize_closing(
+            client, business_date=today, denoms=[(1000, 3)], opening_float_confirm="0.00",
+            justification_note="Trying to justify my way past the block."
+        )
+        assert b"No se puede finalizar" in response.data
+        from app import db
+        with app.app_context():
+            assert db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone() is None, "a blocked closing must not be persisted at all"
+
+    def test_store_manager_can_override_variance_with_justification(self, client, app):
+        _create_user(client, "mgr_override", "store_manager")
+        client.post("/login", data={"username": "mgr_override", "password": "password123"})
+        today = _today_utc()
+        response = _finalize_closing(
+            client, business_date=today, denoms=[(1000, 3)], opening_float_confirm="0.00",
+            justification_note="Fondo de caja sembrado antes de abrir."
+        )
+        assert b"CON VARIACI" in response.data
+        from app import db
+        with app.app_context():
+            closing = db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone()
+        assert closing["status"] == "FINALIZED_WITH_VARIANCE"
+        assert closing["cash_variance_cents"] == 3000
+
+    def test_override_still_requires_a_justification_note(self, client, app):
+        """Holding the override permission is not enough on its own."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        today = _today_utc()
+        response = _finalize_closing(client, business_date=today, denoms=[(1000, 3)], opening_float_confirm="0.00")
+        assert b"nota de justificaci" in response.data
+        from app import db
+        with app.app_context():
+            assert db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone() is None
+
+    def test_accountant_can_still_finalize_a_clean_zero_variance_closing(self, client, app):
+        """The block is variance-specific — it must not lock accountants out
+        of ordinary, balanced closings."""
+        _create_user(client, "acct_clean", "accountant")
+        client.post("/login", data={"username": "acct_clean", "password": "password123"})
+        today = _today_utc()
+        response = _finalize_closing(client, business_date=today, opening_float_confirm="0.00")
+        assert b"sin variaciones" in response.data
+        from app import db
+        with app.app_context():
+            closing = db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone()
+        assert closing["status"] == "FINALIZED"
+
+
+class TestCashDenominations:
+    """Confirmed with the product owner 2026-08-25: 1000/500/200/100/50/20/10/5/1."""
+
+    def test_denomination_set_matches_the_confirmed_values(self):
+        import constants
+        assert constants.CASH_DENOMINATIONS_CENTS == [
+            100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 100
+        ]
+
+    def test_counted_total_sums_denominations_exactly_in_cents(self, client, app):
+        """2x1000 + 1x500 + 3x100 = 2000 + 500 + 300 = 2800 (whole units)
+        => 280000 cents."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        today = _today_utc()
+        _finalize_closing(
+            client, business_date=today,
+            denoms=[(100000, 2), (50000, 1), (10000, 3)],
+            opening_float_confirm="2800.00",
+            justification_note="n/a",
+        )
+        from app import db
+        with app.app_context():
+            closing = db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone()
+        assert closing["cash_counted_total_cents"] == 2 * 100000 + 1 * 50000 + 3 * 10000
+        assert closing["cash_variance_cents"] == 0  # opening float matches the count exactly
+
+    def test_denomination_outside_the_configured_set_is_ignored(self, client, app):
+        """A crafted denom_ field for a value not in the configured set must
+        not contribute to the counted total — the server iterates the
+        configured list rather than trusting whatever fields arrive."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        today = _today_utc()
+        client.post("/daily-closing", data={
+            "store_id": "1", "business_date": today, "opening_float_confirm": "0.00",
+            "denom_7777": "5",  # not a real denomination
+        }, follow_redirects=True)
+        from app import db
+        with app.app_context():
+            closing = db().execute(
+                "SELECT * FROM daily_closings WHERE store_id=1 AND business_date=?", (today,)
+            ).fetchone()
+        assert closing["cash_counted_total_cents"] == 0
+
+
 class TestCashSessions:
     """Feature 3: sessions must close individually before the store's daily
     closing can aggregate/finalize."""

@@ -41,16 +41,23 @@ PERM_CLOSURES_MANAGE = "closures.manage"
 PERM_BREAKAGE_REPORT = "breakage.report"
 PERM_BREAKAGE_APPROVE = "breakage.approve"
 PERM_AUDIT_VIEW = "audit.view"
+# Confirmed with the product owner 2026-08-25: a daily closing with a non-zero
+# cash_variance / reconciliation_difference is BLOCKED by default. Only roles
+# holding this permission may override and finalize anyway, and only with a
+# mandatory justification_note (FINALIZED_WITH_VARIANCE). Everyone else must
+# recount / fix the discrepancy, or escalate to someone who holds it.
+PERM_CLOSING_VARIANCE_OVERRIDE = "closing.variance_override"
 
 ROLE_PERMISSIONS = {
     ROLE_ADMIN: {
         PERM_CATALOG_MANAGE, PERM_USERS_MANAGE, PERM_INVENTORY_MANAGE, PERM_TRANSFER_MANAGE,
         PERM_SALES_CREATE, PERM_CLOSURES_MANAGE, PERM_BREAKAGE_REPORT, PERM_BREAKAGE_APPROVE,
-        PERM_AUDIT_VIEW,
+        PERM_AUDIT_VIEW, PERM_CLOSING_VARIANCE_OVERRIDE,
     },
     ROLE_STORE_MANAGER: {
         PERM_CATALOG_MANAGE, PERM_INVENTORY_MANAGE, PERM_TRANSFER_MANAGE,
         PERM_CLOSURES_MANAGE, PERM_BREAKAGE_REPORT, PERM_BREAKAGE_APPROVE,
+        PERM_CLOSING_VARIANCE_OVERRIDE,
     },
     ROLE_CASHIER: {
         PERM_SALES_CREATE, PERM_BREAKAGE_REPORT,
@@ -202,8 +209,7 @@ VALID_DAILY_CLOSING_STATUSES = [DAILY_CLOSING_STATUS_FINALIZED, DAILY_CLOSING_ST
 DEFAULT_STORE_TIMEZONE = "UTC"
 
 # Cash denomination set (value in cents, descending) used for the physical
-# cash count on both cash-session close and daily-closing finalize. This is a
-# generic USD-like bill/coin set — CONFIRM THE ACTUAL CURRENCY/DENOMINATIONS
-# WITH THE PRODUCT OWNER before relying on this for a real deployment; it was
-# not specified in the brief and is called out again in the Phase 4 summary.
-CASH_DENOMINATIONS_CENTS = [10000, 5000, 2000, 1000, 500, 200, 100, 50, 25, 10, 5, 1]
+# cash count on both cash-session close and daily-closing finalize.
+# Confirmed with the product owner 2026-08-25: 1000/500/200/100/50/20/10/5/1
+# (whole-currency-unit bills and coins, stored here as cents).
+CASH_DENOMINATIONS_CENTS = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 100]

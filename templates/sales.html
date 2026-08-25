@@ -1,1 +1,63 @@
-{% extends 'base.html' %}{% block content %}<div class="heading"><div><p class="eyebrow">PUNTO DE VENTA</p><h1>Registrar venta</h1></div></div><form class="panel" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Tienda<select name="store_id">{% for x in stores %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></label><h2>Productos</h2><table><tr><th>Producto</th><th>Cantidad</th></tr>{% for i in item_rows %}<tr><td><select name="item_product_id_{{ i }}"><option value="">—</option>{% for p in products %}<option value="{{ p.id }}">{{ p.sku }} · {{ p.name }} (${{ '%.2f'|format(p.sale_price_cents / 100) }})</option>{% endfor %}</select></td><td><input name="item_quantity_{{ i }}" type="number" min="1" step="1"></td></tr>{% endfor %}</table><h2>Pagos</h2><table><tr><th>Método</th><th>Monto</th></tr>{% for i in payment_rows %}<tr><td><select name="payment_method_{{ i }}"><option value="">—</option>{% for m in constants.VALID_PAYMENT_METHODS %}<option value="{{ m }}">{{ constants.PAYMENT_DISPLAY_NAMES.get(m, m) }}</option>{% endfor %}</select></td><td><input name="payment_amount_{{ i }}" type="number" step="0.01" min="0"></td></tr>{% endfor %}</table><p class="muted">El total de los pagos debe coincidir exactamente con el total de la venta (precio de catálogo × cantidad).</p><button>Guardar venta</button></form><section class="panel"><h2>Historial reciente</h2><table><tr><th>Tienda</th><th>Total</th><th>Pago</th><th>Fecha</th></tr>{% for sale in sales %}<tr><td>{{ sale.store_name }}</td><td>${{ '%.2f'|format(sale.total_cents / 100) }}</td><td>{{ sale.methods or '' }}</td><td>{{ sale.created_at }}</td></tr>{% endfor %}</table></section>{% endblock %}
+{% extends 'base.html' %}{% block content %}
+<div class="heading"><div><p class="eyebrow">PUNTO DE VENTA</p><h1>Registrar venta</h1></div></div>
+
+<form method="post" id="pos-form"
+      data-max-items="{{ max_item_rows }}"
+      data-max-payments="{{ max_payment_rows }}"
+      data-products="{{ products_json|tojson|forceescape }}"
+      data-stock="{{ stock_by_store|tojson|forceescape }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+<div class="pos-layout">
+  <section class="pos-products panel">
+    <div class="pos-toolbar">
+      <label>Tienda<select name="store_id" id="pos-store">{% for x in stores %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></label>
+      <label>Buscar<input type="search" id="pos-search" placeholder="Nombre o SKU..." autocomplete="off"></label>
+    </div>
+    <div class="pos-grid" id="pos-grid">
+      {% for p in products %}
+      <button type="button" class="pos-tile" data-product-id="{{ p.id }}" data-name="{{ p.name }}" data-sku="{{ p.sku }}">
+        <span class="pos-tile-name">{{ p.name }}</span>
+        <span class="pos-tile-sku">{{ p.sku }}</span>
+        <span class="pos-tile-price">${{ '%.2f'|format(p.sale_price_cents / 100) }}</span>
+        <span class="pos-tile-stock" data-stock-for="{{ p.id }}"></span>
+      </button>
+      {% else %}
+      <p class="muted">No hay productos activos. Crea productos en Catálogo.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <aside class="pos-cart panel">
+    <h2>Ticket</h2>
+    <table class="pos-cart-table">
+      <tbody id="pos-cart-lines">
+        <tr id="pos-cart-empty"><td colspan="4" class="muted">Toca un producto para agregarlo.</td></tr>
+      </tbody>
+    </table>
+    <div class="pos-total"><span>Total</span><b id="pos-total">$0.00</b></div>
+
+    <h3>Pagos</h3>
+    <div id="pos-payments"></div>
+    <button type="button" class="button-secondary" id="pos-add-payment">+ Agregar pago</button>
+    <div class="pos-total"><span>Pagado</span><b id="pos-paid">$0.00</b></div>
+    <div class="pos-total"><span>Pendiente</span><b id="pos-due">$0.00</b></div>
+
+    <p id="pos-message" class="muted">Agrega productos y pagos para continuar.</p>
+    <button id="pos-submit" disabled>Cobrar</button>
+    <div id="pos-hidden-fields"></div>
+  </aside>
+</div>
+</form>
+
+<section class="panel"><h2>Historial reciente</h2><table><tr><th>Tienda</th><th>Total</th><th>Pago</th><th>Fecha</th></tr>{% for sale in sales %}<tr><td>{{ sale.store_name }}</td><td>${{ '%.2f'|format(sale.total_cents / 100) }}</td><td>{{ sale.methods or '' }}</td><td>{{ sale.created_at }}</td></tr>{% else %}<tr><td colspan="4" class="muted">Aún no hay ventas registradas.</td></tr>{% endfor %}</table></section>
+
+<template id="pos-payment-row-template">
+  <div class="pos-payment-row">
+    <select class="pos-payment-method">{% for m in payment_methods %}<option value="{{ m }}">{{ payment_display.get(m, m) }}</option>{% endfor %}</select>
+    <input class="pos-payment-amount" type="number" step="0.01" min="0" placeholder="0.00">
+    <button type="button" class="button-secondary pos-remove-payment">×</button>
+  </div>
+</template>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='pos.js') }}"></script>{% endblock %}
