@@ -567,6 +567,34 @@ def assigned(location_type, location_id):
     return db().execute(f"SELECT 1 FROM {table} WHERE user_id=? AND {column}=?", (g.user["id"], location_id)).fetchone() is not None
 
 
+def parse_location_value(value):
+    """Parse a combined '<type>:<id>' <select> value (transfer.html /
+    inventory.html) into (location_type, location_id_int).
+
+    QA finding: this used to be two independent form fields — a "tipo" select
+    and a location-name select — that weren't linked to each other. A user
+    could pick a location by name while the paired type select silently stayed
+    on its default, submitting a (type, id) pair that didn't describe the
+    location they'd actually picked. Store ids and warehouse ids are separate
+    sequences that collide constantly (both routinely have id=1, id=2, ...),
+    so the mismatch was easy to trigger by accident and, worse, mostly silent —
+    it only surfaced as an error in the one case where the mismatched pair
+    happened to hit a nonexistent row and trip the audit_logs FK constraint;
+    every other mismatch just moved stock to/from the wrong location with no
+    error at all. One combined select removes the possibility of mismatch by
+    construction; location_exists() below is the actual validation, not the
+    accidental FK side effect."""
+    location_type, _, location_id_str = value.partition(":")
+    if location_type not in constants.VALID_LOCATION_TYPES or not location_id_str:
+        raise ValueError(f"Invalid location value: {value!r}")
+    return location_type, int(location_id_str)
+
+
+def location_exists(connection, location_type, location_id):
+    table = "stores" if location_type == "store" else "warehouses"
+    return connection.execute(f"SELECT 1 FROM {table} WHERE id=? AND active=1", (location_id,)).fetchone() is not None
+
+
 @app.before_request
 def load_user():
     g.user = None
@@ -801,35 +829,44 @@ def transfer():
             # Validate and parse inputs
             product_id = int(request.form.get("product_id", 0))
             quantity_str = request.form.get("quantity", "")
-            source_type = request.form.get("source_type", "").strip()
-            source_id = int(request.form.get("source_id", 0))
-            target_type = request.form.get("target_type", "").strip()
-            target_id = int(request.form.get("target_id", 0))
-            
+            try:
+                source_type, source_id = parse_location_value(request.form.get("source", ""))
+                target_type, target_id = parse_location_value(request.form.get("target", ""))
+            except ValueError:
+                flash("Invalid source/target location.", "error")
+                return redirect(url_for("transfer"))
+
             # Validate quantity
             valid, error = validate_quantity(quantity_str)
             if not valid:
                 flash(error, "error")
                 return redirect(url_for("transfer"))
-            
+
             quantity = int(quantity_str)
-            
-            # Validate location types
-            if source_type not in ("store", "warehouse") or target_type not in ("store", "warehouse"):
-                flash("Invalid location type.", "error")
+
+            # QA fix: the location select no longer lets a mismatched (type, id)
+            # pair be constructed at all (see parse_location_value), but a
+            # non-browser client could still POST a bogus id directly, and
+            # admin's assigned() bypass below wouldn't catch it — so verify
+            # both locations are real rows, not just well-formed values.
+            if not location_exists(connection, source_type, source_id):
+                flash("El origen seleccionado no existe.", "error")
                 return redirect(url_for("transfer"))
-            
+            if not location_exists(connection, target_type, target_id):
+                flash("El destino seleccionado no existe.", "error")
+                return redirect(url_for("transfer"))
+
             # SECURITY FIX: Prevent self-transfer
             if source_type == target_type and source_id == target_id:
                 flash("Source and target locations cannot be the same.", "error")
                 return redirect(url_for("transfer"))
-            
+
             # Check permissions
             if not assigned(source_type, source_id) or not assigned(target_type, target_id):
                 flash("No tienes asignado el origen o destino seleccionado.", "error")
                 logger.warning(f"Unauthorized transfer attempt by user {g.user['id']}")
                 return redirect(url_for("transfer"))
-            
+
             # Check product exists
             product = connection.execute("SELECT * FROM products WHERE id=? AND active=1", (product_id,)).fetchone()
             if not product:
@@ -918,25 +955,23 @@ def inventory():
         try:
             # Validate and parse inputs
             product_id = int(request.form.get("product_id", 0))
-            location_type = request.form.get("location_type", "").strip()
-            location_id = int(request.form.get("location_id", 0))
+            try:
+                location_type, location_id = parse_location_value(request.form.get("location", ""))
+            except ValueError:
+                flash("Invalid location.", "error")
+                return redirect(url_for("inventory"))
             movement_type = request.form.get("movement_type", "").strip()
             quantity_str = request.form.get("quantity", "")
             reason = request.form.get("reason", "").strip()
-            
+
             # Validate quantity
             valid, error = validate_quantity(quantity_str)
             if not valid:
                 flash(error, "error")
                 return redirect(url_for("inventory"))
-            
+
             quantity = int(quantity_str)
-            
-            # Validate location type and movement type
-            if location_type not in ("store", "warehouse"):
-                flash("Invalid location type.", "error")
-                return redirect(url_for("inventory"))
-            
+
             if movement_type not in constants.VALID_MANUAL_MOVEMENT_TYPES:
                 flash("Invalid movement type.", "error")
                 return redirect(url_for("inventory"))
@@ -945,6 +980,13 @@ def inventory():
             valid, error = validate_input(reason, "Reason", min_length=0, max_length=255, required=False)
             if not valid:
                 flash(error, "error")
+                return redirect(url_for("inventory"))
+
+            # QA fix: same root cause as /transfer — verify the location is a
+            # real row, not just a well-formed (type, id) pair (see
+            # parse_location_value's docstring for the full story).
+            if not location_exists(connection, location_type, location_id):
+                flash("La ubicación seleccionada no existe.", "error")
                 return redirect(url_for("inventory"))
 
             # Check permissions
@@ -1095,6 +1137,14 @@ def sales():
             store_id = int(request.form.get("store_id", 0))
         except (ValueError, TypeError):
             flash("Invalid store ID.", "error")
+            return redirect(url_for("sales"))
+
+        # QA fix (same class of bug as /transfer's location mismatch):
+        # assigned() returns True unconditionally for admin regardless of
+        # whether store_id is real, and sales.store_id has a FK — a bogus id
+        # would 500 on an unhandled IntegrityError instead of failing cleanly.
+        if not location_exists(connection, "store", store_id):
+            flash("La tienda seleccionada no existe.", "error")
             return redirect(url_for("sales"))
 
         # FEATURE 2: a sale can only deduct stock from its own store — enforced
@@ -1273,6 +1323,12 @@ def cash_sessions():
             flash(f"Monto inicial: {e}", "error")
             return redirect(url_for("cash_sessions"))
 
+        # QA fix (same class of bug as /transfer's location mismatch):
+        # cash_sessions.store_id has a FK — verify it's real before admin's
+        # assigned() bypass lets a bogus id through to an unhandled 500.
+        if not location_exists(connection, "store", store_id):
+            flash("La tienda seleccionada no existe.", "error")
+            return redirect(url_for("cash_sessions"))
         if not assigned("store", store_id):
             flash("No tienes acceso a esa tienda.", "error")
             return redirect(url_for("cash_sessions"))
@@ -1569,6 +1625,13 @@ def breakages():
                 flash(error, "error")
             return redirect(url_for("breakages"))
         quantity = int(quantity_str)
+
+        # QA fix (same class of bug as /transfer's location mismatch): verify
+        # the store is real before the FK-backed INSERT below, rather than
+        # letting a bogus id 500 on an unhandled IntegrityError.
+        if not location_exists(connection, "store", store_id):
+            flash("La tienda seleccionada no existe.", "error")
+            return redirect(url_for("breakages"))
 
         if not assigned("store", store_id):
             flash("No tienes acceso a esa tienda.", "error")

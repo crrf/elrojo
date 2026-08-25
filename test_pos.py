@@ -42,7 +42,7 @@ def _catalog_product_form(sku, name, cost_price="5.00", sale_price="10.00"):
 
 def _add_stock(client, product_id=1, quantity=100, location_type="store", location_id=1, reason="Setup"):
     return client.post("/inventory", data={
-        "product_id": str(product_id), "location_type": location_type, "location_id": str(location_id),
+        "product_id": str(product_id), "location": f"{location_type}:{location_id}",
         "movement_type": "ENTRY", "quantity": str(quantity), "reason": reason,
     })
 
@@ -325,12 +325,24 @@ class TestSales:
 
     def test_sale_cannot_deduct_from_unassigned_store(self, client):
         """FEATURE 2: server-side store scoping, not just UI restriction."""
-        _create_user(client, "cashier_store_scope", "cashier")
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        client.post("/catalog", data={"kind": "store", "name": "Otra tienda", "address": "x", "timezone": "UTC"})
+        client.get("/logout")
+        _create_user(client, "cashier_store_scope", "cashier")  # only assigned to store 1
         client.post("/login", data={"username": "cashier_store_scope", "password": "password123"})
-        # store 2 doesn't exist / isn't assigned to this cashier (only store 1 was assigned by _create_user)
         response = client.post("/sales", data=_sale_form(2, [(1, 1)], [("CASH", "10.00")]), follow_redirects=True)
         assert response.status_code == 200
         assert b"No tienes acceso" in response.data
+
+    def test_sale_rejects_nonexistent_store_cleanly(self, client):
+        """QA fix: store_id=999 used to reach an unhandled FK IntegrityError
+        (sales.store_id -> stores.id) for admin, since assigned() bypasses the
+        assignment check entirely for admin and there was no explicit
+        existence check. Now fails with a clean message, not a 500."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        response = client.post("/sales", data=_sale_form(999, [(1, 1)], [("CASH", "10.00")]), follow_redirects=True)
+        assert response.status_code == 200
+        assert b"tienda seleccionada no existe" in response.data
 
 
 class TestConcurrentSales:
@@ -400,8 +412,7 @@ class TestInventory:
         })
         response = client.post("/inventory", data={
             "product_id": "1",
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "ENTRY",
             "quantity": "10",
             "reason": "Purchase"
@@ -418,8 +429,7 @@ class TestInventory:
         # First add stock
         client.post("/inventory", data={
             "product_id": "1",
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "ENTRY",
             "quantity": "10",
             "reason": "Setup"
@@ -427,8 +437,7 @@ class TestInventory:
         # Then remove some
         response = client.post("/inventory", data={
             "product_id": "1",
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "EXIT",
             "quantity": "5",
             "reason": "Damage"
@@ -444,8 +453,7 @@ class TestInventory:
         })
         response = client.post("/inventory", data={
             "product_id": "1",
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "EXIT",
             "quantity": "1000",
             "reason": "Invalid"
@@ -462,8 +470,7 @@ class TestInventory:
         # First add stock to warehouse
         client.post("/inventory", data={
             "product_id": "1",
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "ENTRY",
             "quantity": "20",
             "reason": "Setup"
@@ -471,10 +478,8 @@ class TestInventory:
         # Now transfer to store
         response = client.post("/transfer", data={
             "product_id": "1",
-            "source_type": "warehouse",
-            "source_id": "1",
-            "target_type": "store",
-            "target_id": "1",
+            "source": "warehouse:1",
+            "target": "store:1",
             "quantity": "5"
         }, follow_redirects=True)
         assert response.status_code == 200
@@ -488,10 +493,8 @@ class TestInventory:
         })
         response = client.post("/transfer", data={
             "product_id": "1",
-            "source_type": "warehouse",
-            "source_id": "1",
-            "target_type": "warehouse",
-            "target_id": "1",
+            "source": "warehouse:1",
+            "target": "warehouse:1",
             "quantity": "5"
         }, follow_redirects=True)
         assert response.status_code == 200
@@ -505,14 +508,111 @@ class TestInventory:
         })
         response = client.post("/transfer", data={
             "product_id": "1",
-            "source_type": "warehouse",
-            "source_id": "1",
-            "target_type": "store",
-            "target_id": "1",
+            "source": "warehouse:1",
+            "target": "store:1",
             "quantity": "9999"
         }, follow_redirects=True)
         assert response.status_code == 200
         assert b"Stock insuficiente" in response.data or b"insufficient" in response.data.lower()
+
+
+class TestLocationValueParsing:
+    """Regression tests for a real bug found in production use: transfer.html
+    and inventory.html used to split "which location" into two independent
+    <select> elements (a type dropdown + a name dropdown) that weren't linked.
+    Picking a location by name left the paired type select on its default,
+    silently submitting a (type, id) pair that didn't match — store/warehouse
+    ids collide constantly since they're separate sequences. Reported
+    scenario: create a warehouse, stock the main warehouse, transfer to the
+    new warehouse -> the mismatched pair tripped an incidental audit_logs FK
+    violation instead of a real validation error."""
+
+    def test_warehouse_to_new_warehouse_transfer_reported_bug_now_works(self, client, app):
+        """The exact reported repro: create a second warehouse, stock the
+        first, transfer between them via the combined select's real values."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        client.post("/catalog", data={"kind": "warehouse", "name": "Almacen secundario", "address": "Test"})
+        from app import db
+        with app.app_context():
+            new_warehouse_id = db().execute(
+                "SELECT id FROM warehouses WHERE name='Almacen secundario'"
+            ).fetchone()["id"]
+        client.post("/inventory", data={
+            "product_id": "1", "location": "warehouse:1", "movement_type": "ENTRY",
+            "quantity": "20", "reason": "stock inicial",
+        })
+        response = client.post("/transfer", data={
+            "product_id": "1", "source": "warehouse:1", "target": f"warehouse:{new_warehouse_id}",
+            "quantity": "5",
+        }, follow_redirects=True)
+        assert b"realizado" in response.data
+        with app.app_context():
+            connection = db()
+            source_stock = connection.execute(
+                "SELECT quantity FROM stock WHERE product_id=1 AND location_type='warehouse' AND location_id=1"
+            ).fetchone()
+            target_stock = connection.execute(
+                "SELECT quantity FROM stock WHERE product_id=1 AND location_type='warehouse' AND location_id=?",
+                (new_warehouse_id,)
+            ).fetchone()
+        assert source_stock["quantity"] == 15
+        assert target_stock["quantity"] == 5
+
+    def test_transfer_to_nonexistent_location_rejected_with_no_partial_effect(self, client, app):
+        """The dangerous half of the original bug: with two independent
+        selects, a mismatched (type, id) pair that happened to hit a
+        nonexistent row only failed by accident, via an unrelated audit_logs
+        FK violation — and every OTHER mismatch (colliding with a *real* but
+        wrong location) succeeded silently. location_exists() now makes this
+        an explicit, direct check instead of an incidental side effect."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        client.post("/inventory", data={
+            "product_id": "1", "location": "warehouse:1", "movement_type": "ENTRY",
+            "quantity": "20", "reason": "setup",
+        })
+        response = client.post("/transfer", data={
+            "product_id": "1", "source": "warehouse:1", "target": "store:999",
+            "quantity": "5",
+        }, follow_redirects=True)
+        assert b"destino seleccionado no existe" in response.data
+        with app.app_context():
+            from app import db
+            source_stock = db().execute(
+                "SELECT quantity FROM stock WHERE product_id=1 AND location_type='warehouse' AND location_id=1"
+            ).fetchone()
+        assert source_stock["quantity"] == 20  # untouched — no partial/incorrect deduction
+
+    def test_nonexistent_location_in_inventory_movement_is_rejected(self, client):
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        response = client.post("/inventory", data={
+            "product_id": "1", "location": "store:999", "movement_type": "ENTRY",
+            "quantity": "10", "reason": "test",
+        }, follow_redirects=True)
+        assert b"ubicaci" in response.data.lower() and b"no existe" in response.data.lower()
+
+    def test_malformed_location_value_rejected_cleanly(self, client):
+        """A crafted request with no ':' separator, or a garbage type, must be
+        rejected with a clean flash — not a 500 or an unhandled exception."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        response = client.post("/transfer", data={
+            "product_id": "1", "source": "not-a-valid-value", "target": "store:1", "quantity": "1",
+        }, follow_redirects=True)
+        assert response.status_code == 200
+        assert b"Invalid source/target location" in response.data
+
+    def test_admin_cannot_transfer_to_nonexistent_warehouse_either(self, client, app):
+        """The original bug's admin-specific gap: assigned() bypasses the
+        assignment check entirely for admin, so only an explicit
+        location_exists() check (not the assignment table) catches this."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        client.post("/inventory", data={
+            "product_id": "1", "location": "warehouse:1", "movement_type": "ENTRY",
+            "quantity": "10", "reason": "setup",
+        })
+        response = client.post("/transfer", data={
+            "product_id": "1", "source": "warehouse:1", "target": "warehouse:999", "quantity": "5",
+        }, follow_redirects=True)
+        assert b"destino seleccionado no existe" in response.data
 
 
 # ==================== DAILY CLOSING TESTS (Phase 4 / Feature 3) ====================
@@ -758,6 +858,14 @@ class TestCashSessions:
         response = client.post("/cash-sessions", data={"store_id": "1", "opening_amount": "0"}, follow_redirects=True)
         assert b"Ya tienes una caja abierta" in response.data
 
+    def test_open_session_rejects_nonexistent_store_cleanly(self, client):
+        """QA fix: same FK-blind-trust gap as /sales and /breakages —
+        cash_sessions.store_id has a FK, admin's assigned() bypass didn't
+        previously catch a bogus id."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        response = client.post("/cash-sessions", data={"store_id": "999", "opening_amount": "0"}, follow_redirects=True)
+        assert b"tienda seleccionada no existe" in response.data
+
 
 # ==================== INPUT VALIDATION TESTS ====================
 
@@ -817,8 +925,7 @@ class TestErrorHandling:
         })
         response = client.post("/inventory", data={
             "product_id": "9999",  # Non-existent
-            "location_type": "warehouse",
-            "location_id": "1",
+            "location": "warehouse:1",
             "movement_type": "ENTRY",
             "quantity": "10",
             "reason": "Test"
@@ -984,7 +1091,7 @@ class TestAuditLogCompleteness:
     def test_inventory_movement_is_audited(self, client, app):
         client.post("/login", data={"username": "admin", "password": "admin123"})
         client.post("/inventory", data={
-            "product_id": "1", "location_type": "warehouse", "location_id": "1",
+            "product_id": "1", "location": "warehouse:1",
             "movement_type": "ENTRY", "quantity": "10", "reason": "Audit test",
         })
         from app import db
@@ -1081,6 +1188,13 @@ class TestBreakages:
         client.post("/login", data={"username": "admin", "password": "admin123"})
         response = _report_breakage(client, reason="not-a-real-reason")
         assert b"Invalid reason" in response.data
+
+    def test_report_breakage_rejects_nonexistent_store_cleanly(self, client):
+        """QA fix: same FK-blind-trust gap as /sales — breakages.store_id has
+        a FK, and admin's assigned() bypass didn't previously catch a bogus id."""
+        client.post("/login", data={"username": "admin", "password": "admin123"})
+        response = _report_breakage(client, store_id=999)
+        assert b"tienda seleccionada no existe" in response.data
 
     def test_cashier_can_report_but_not_approve(self, client, app):
         client.post("/login", data={"username": "admin", "password": "admin123"})
